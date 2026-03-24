@@ -1,12 +1,6 @@
 # local-agent-bench
 
-Benchmark local LLM inference servers for agentic workloads. Single script, client-side, works across Ollama, vLLM, TensorRT-LLM, and llama.cpp.
-
-Simulates a multi-turn agent session and measures:
-- **TTFT** — time to first token (prefill latency)
-- **Prefill tok/s** — input tokens processed per second
-- **Decode tok/s** — output tokens generated per second
-- **E2E latency** — total wall time per turn
+A lightweight benchmarking tool that measures real-world agent performance — TTFT, prefill throughput, decode speed, and end-to-end latency — across multi-turn conversations with prefix caching. Supports Ollama, vLLM, TensorRT-LLM, and llama.cpp. One script, one dependency.
 
 ## Setup
 
