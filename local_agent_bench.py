@@ -203,7 +203,8 @@ def send_openai(url, model, text, max_tokens):
                     if choices:
                         d = choices[0].get("delta", {})
                         c = d.get("content", "") or ""
-                        r = d.get("reasoning_content", "") or ""
+                        r = (d.get("reasoning_content", "")
+                             or d.get("reasoning", "") or "")
                         # TTFT = first token of any kind
                         if (c or r) and t_first is None:
                             t_first = time.perf_counter()
