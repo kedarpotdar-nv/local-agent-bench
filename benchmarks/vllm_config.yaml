@@ -1,0 +1,14 @@
+# vLLM config optimized for single-user agent latency on DGX Spark (Blackwell)
+#
+# Key choices:
+#   fp8 KV cache: halves memory, more room for cached prefixes
+#   prefix caching: block-level hash-based KV reuse
+#   large batched tokens: process full prefix in one prefill pass
+#   small cudagraph: save memory for KV cache at low concurrency
+#
+kv-cache-dtype: fp8
+compilation-config: '{"pass_config":{"fuse_allreduce_rms":true,"eliminate_noops":true}}'
+enable-prefix-caching: true
+max-cudagraph-capture-size: 256
+max-num-batched-tokens: 32768
+max-model-len: 32768
