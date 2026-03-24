@@ -2,20 +2,32 @@
 
 Benchmark local LLM inference servers for agentic workloads. Single script, client-side, works across Ollama, vLLM, TensorRT-LLM, and llama.cpp.
 
+Simulates a multi-turn agent session and measures:
+- **TTFT** — time to first token (prefill latency)
+- **Prefill tok/s** — input tokens processed per second
+- **Decode tok/s** — output tokens generated per second
+- **E2E latency** — total wall time per turn
+
 ## Setup
 
 ```bash
 pip install transformers
 ```
 
-## Usage
+## Quick start (Qwen3.5-35B-A3B on Ollama)
 
 ```bash
-python3 local_agent_bench.py --backend ollama --model qwen3.5:35b --tokenizer Qwen/Qwen3.5-35B-A3B
-python3 local_agent_bench.py --backend vllm --url http://localhost:8000 --model my-model --tokenizer my-model
+ollama pull qwen3.5:35b
+
+python3 local_agent_bench.py \
+    --backend ollama \
+    --model qwen3.5:35b \
+    --tokenizer Qwen/Qwen3.5-35B-A3B \
+    --turns "0,16384,128|16384,128,128|16384,4096,512" \
+    --output ollama_qwen35.json
 ```
 
-Run `python3 local_agent_bench.py --help` for all options (`--repeats`, `--turns`, `--output`, etc.).
+See `benchmarks/` for more model configs (vLLM, TRT-LLM, etc.). Run `python3 local_agent_bench.py --help` for all options (`--repeats`, `--turns`, `--output`, etc.).
 
 ## Default turns
 
