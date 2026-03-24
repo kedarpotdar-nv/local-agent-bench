@@ -18,7 +18,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name vllm-bench \
     nvcr.io/nvidia/vllm:26.02-py3 \
     vllm serve openai/gpt-oss-120b \
     --config /workspace/config.yaml \
-    --gpu-memory-utilization 0.9 \
+    --gpu-memory-utilization 0.8 \
     --max-num-seqs 8 \
     --disable-log-requests
 ```
