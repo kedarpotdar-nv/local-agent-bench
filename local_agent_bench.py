@@ -409,11 +409,18 @@ def measure_call(label, url, model, messages, max_tokens, send_fn, tokenizer,
     prefill_ms = server.get("prompt_eval_ms", 0)
     prefill_tps = server_isl / (prefill_ms / 1000) if prefill_ms > 0 else 0
 
+    # Projected E2E: what this call would cost if the model generated
+    # exactly max_tokens. Deterministic across hardware for comparison.
+    # projected_e2e = TTFT + (max_tokens / decode_tps)
+    projected_e2e = (ttft_client + max_tokens / decode_tps * 1000
+                     if decode_tps > 0 else total_client)
+
     return {
         "label": label,
         "ttft_client_ms": round(ttft_client, 1),
         "decode_client_ms": round(decode_client, 1),
         "total_client_ms": round(total_client, 1),
+        "projected_e2e_ms": round(projected_e2e, 1),
         "server_isl": server_isl,
         "output_tokens": tokens,
         "output_tokens_requested": max_tokens,
@@ -426,21 +433,23 @@ def measure_call(label, url, model, messages, max_tokens, send_fn, tokenizer,
 
 def print_call_result(r):
     """Print a single call result."""
-    print(f"  Client TTFT:    {r['ttft_client_ms']:>8.0f}ms")
-    print(f"  Client Decode:  {r['decode_client_ms']:>8.0f}ms  "
-          f"({r['output_tokens']} tokens [{r['token_source']}], "
-          f"{r['decode_tps']:.1f} tok/s)")
-    print(f"  Client E2E:     {r['total_client_ms']:>8.0f}ms")
+    print(f"  Client TTFT:      {r['ttft_client_ms']:>8.0f}ms")
+    print(f"  Client Decode:    {r['decode_client_ms']:>8.0f}ms  "
+          f"({r['output_tokens']}/{r['output_tokens_requested']} tokens "
+          f"[{r['token_source']}], {r['decode_tps']:.1f} tok/s)")
+    print(f"  E2E (measured):   {r['total_client_ms']:>8.0f}ms")
+    print(f"  E2E (projected):  {r['projected_e2e_ms']:>8.0f}ms  "
+          f"(TTFT + {r['output_tokens_requested']}t / {r['decode_tps']:.1f} tok/s)")
     if r.get("server_isl"):
-        print(f"  Server ISL:     {r['server_isl']:>8d} tokens")
+        print(f"  Server ISL:       {r['server_isl']:>8d} tokens")
     if r.get("server_prompt_eval_ms"):
         pe = r["server_prompt_eval_ms"]
         ev = r.get("server_eval_ms", 0)
         ec = r.get("server_eval_count", 0)
         ev_tps = ec / (ev / 1000) if ev > 0 else 0
-        print(f"  Server Prefill: {pe:>6.0f}ms  "
+        print(f"  Server Prefill:   {pe:>6.0f}ms  "
               f"(ISL={r['server_isl']}, {r['prefill_tps']:.0f} tok/s)")
-        print(f"  Server Decode:  {ev:>6.0f}ms  "
+        print(f"  Server Decode:    {ev:>6.0f}ms  "
               f"({ec} tokens, {ev_tps:.1f} tok/s)")
     print()
 
@@ -504,30 +513,40 @@ def run_openclaw_profile(url, model, send_fn, tokenizer, repeats, tools,
     print(f"{'='*60}")
 
     # Aggregate across calls and runs
-    for i, (label, _, _, _) in enumerate(OPENCLAW_PROFILE):
+    for i, (label, _, _, out_tokens) in enumerate(OPENCLAW_PROFILE):
         call_results = [run[i] for run in all_results]
         ttfts = [r["ttft_client_ms"] for r in call_results]
         e2es = [r["total_client_ms"] for r in call_results]
+        proj_e2es = [r["projected_e2e_ms"] for r in call_results]
         decode_list = [r["decode_tps"] for r in call_results if r["decode_tps"] > 0]
         isls = [r["server_isl"] for r in call_results if r["server_isl"] > 0]
 
         ttft = statistics.median(ttfts) if ttfts else 0
         e2e = statistics.median(e2es) if e2es else 0
+        proj = statistics.median(proj_e2es) if proj_e2es else 0
         dec = statistics.median(decode_list) if decode_list else 0
         isl = statistics.median(isls) if isls else 0
 
         all_summaries.append({
             "label": label, "ttft_ms": round(ttft),
-            "e2e_ms": round(e2e), "decode_tps": round(dec, 1),
+            "e2e_ms": round(e2e), "projected_e2e_ms": round(proj),
+            "decode_tps": round(dec, 1),
             "server_isl": round(isl),
+            "output_tokens_requested": out_tokens,
         })
 
-    print(f"\n  {'Call':<30s} {'ISL':>7s} {'TTFT':>8s} {'E2E':>8s} {'Decode':>8s}")
-    print(f"  {'-'*65}")
+    print(f"\n  {'Call':<28s} {'ISL':>6s} {'TTFT':>7s} {'Decode':>7s} "
+          f"{'E2E(m)':>8s} {'E2E(p)':>8s}")
+    print(f"  {'-'*70}")
+    total_proj = 0
     for s in all_summaries:
-        print(f"  {s['label']:<30s} {s['server_isl']:>6.0f}t "
-              f"{s['ttft_ms']:>7.0f}ms {s['e2e_ms']:>7.0f}ms "
-              f"{s['decode_tps']:>7.1f}t/s")
+        total_proj += s["projected_e2e_ms"]
+        print(f"  {s['label']:<28s} {s['server_isl']:>5.0f}t "
+              f"{s['ttft_ms']:>6.0f}ms {s['decode_tps']:>6.1f} "
+              f"{s['e2e_ms']:>7.0f}ms {s['projected_e2e_ms']:>7.0f}ms")
+    print(f"\n  E2E(m) = measured    E2E(p) = projected (TTFT + num_predict/decode_tps)")
+    print(f"  Use E2E(p) for hardware comparison — deterministic regardless of model output length.")
+    print(f"  Projected session total: {total_proj/1000:.1f}s across 17 calls")
 
     if output_file:
         out = {

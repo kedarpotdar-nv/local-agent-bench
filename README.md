@@ -185,10 +185,17 @@ python3 local_agent_bench.py --backend ollama --model qwen3:30b \
 ## What the benchmark measures (and doesn't)
 
 **Measures accurately (for hardware comparison):**
-- Decode tok/s at realistic ISL (9.4K → 13.7K) — the key hardware metric
-- Prefill throughput with KV cache reuse across multi-call chains
-- TTFT (time to first token) including CPU overhead
+- **Decode tok/s** at realistic ISL (9.4K → 13.7K) — the key hardware metric
+- **Prefill throughput** with KV cache reuse across multi-call chains
+- **TTFT** (time to first token) including CPU overhead
+- **Projected E2E** = TTFT + num_predict / decode_tps — deterministic, comparable across hardware
 - ISL growth pattern matching real agentic tool-calling workloads
+
+**Two E2E metrics:**
+- `E2E(measured)` — actual wall time for this run. Varies because models generate different token counts for the same prompt.
+- `E2E(projected)` — TTFT + (target output tokens / measured decode tok/s). Deterministic. **Use this for hardware comparison.**
+
+**Known limitation — `ignore_eos`:** Ollama's `/api/chat` does not support disabling EOS. The model may generate fewer tokens than `num_predict` on short/simple prompts. With the OpenClaw profile (7,900-token system prompt + accumulated context), the model typically generates enough tokens for stable decode measurement. Projected E2E compensates for any shortfall.
 
 **Does not model:**
 - Actual thinking depth (synthetic prompts; but decode tok/s is the same regardless of content)
