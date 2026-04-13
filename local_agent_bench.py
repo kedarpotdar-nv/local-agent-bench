@@ -12,31 +12,31 @@ Metrics:
   tok/s: ALL output tokens (thinking + content) / decode wall time
          Token count from: server usage field > tokenizer count > chunk count
 
+Profiles:
+  openclaw  Realistic OpenClaw agentic workload (default)
+            8 user turns, 17 inference calls, multi-call chains.
+            Based on 112 interactive turns from 64 real OpenClaw sessions.
+            ISL: 9.4K → 13.7K tokens. Includes system prompt + tool schemas.
+  legacy    Original 3-turn benchmark (backward compatible)
+            ISL: 16K cold → 16K cached + 4K new. No system prompt or tools.
+
 Usage:
-  # Ollama
-  python3 local_agent_bench.py --backend ollama --model qwen3.5:35b \
-    --tokenizer Qwen/Qwen3.5-35B-A3B
+  # OpenClaw profile on Ollama (recommended)
+  python3 local_agent_bench.py --backend ollama --model qwen3:30b \\
+    --tokenizer Qwen/Qwen3-30B-A3B --profile openclaw
 
-  # vLLM
-  python3 local_agent_bench.py --backend vllm --url http://localhost:8000 \
-    --model openai/gpt-oss-120b --tokenizer openai/gpt-oss-120b
+  # Legacy profile (backward compatible)
+  python3 local_agent_bench.py --backend ollama --model qwen3:30b \\
+    --tokenizer Qwen/Qwen3-30B-A3B --profile legacy
 
-  # TensorRT-LLM
-  python3 local_agent_bench.py --backend trtllm --url http://localhost:8000 \
-    --model my-model --tokenizer my-model-hf-name
-
-  # llama.cpp-server
-  python3 local_agent_bench.py --backend llamacpp --url http://localhost:8080 \
-    --model default --tokenizer Qwen/Qwen3.5-35B-A3B
+  # Custom turns (same as before)
+  python3 local_agent_bench.py --backend ollama --model qwen3:30b \\
+    --tokenizer Qwen/Qwen3-30B-A3B \\
+    --turns "0,16384,128|16384,128,128|16384,4096,512"
 
   # Repeated runs for statistical confidence
-  python3 local_agent_bench.py --backend ollama --model qwen3.5:35b \
-    --tokenizer Qwen/Qwen3.5-35B-A3B --repeats 5
-
-  # Custom turn configs
-  python3 local_agent_bench.py --backend ollama --model qwen3.5:35b \
-    --tokenizer Qwen/Qwen3.5-35B-A3B \
-    --turns "0,16384,128|16384,128,128|16384,4096,512"
+  python3 local_agent_bench.py --backend ollama --model qwen3:30b \\
+    --tokenizer Qwen/Qwen3-30B-A3B --profile openclaw --repeats 3
 """
 
 import argparse
@@ -85,18 +85,139 @@ def count_tokens(text, tokenizer):
 
 
 # ---------------------------------------------------------------------------
+# OpenClaw tool schemas (18 tools, adds ~1,485 ISL tokens when sent to Ollama)
+# Measured via prompt_eval_count delta on DGX Spark, April 2026.
+# ---------------------------------------------------------------------------
+
+OPENCLAW_TOOLS = [
+    {"type": "function", "function": {"name": "read", "description": "Read file contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write", "description": "Create or overwrite a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit", "description": "Make precise edits to files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
+    {"type": "function", "function": {"name": "apply_patch", "description": "Apply multi-file unified diffs", "parameters": {"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"]}}},
+    {"type": "function", "function": {"name": "grep", "description": "Search file contents for patterns", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}, "include": {"type": "string"}}, "required": ["pattern"]}}},
+    {"type": "function", "function": {"name": "find", "description": "Find files by glob pattern", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["pattern"]}}},
+    {"type": "function", "function": {"name": "ls", "description": "List directory contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "exec", "description": "Run shell commands", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}, "background": {"type": "boolean"}, "yieldMs": {"type": "integer"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "process", "description": "Manage background exec sessions", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["poll", "kill", "list"]}, "id": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "web_search", "description": "Search the web", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "count": {"type": "integer"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "web_fetch", "description": "Fetch readable content from a URL", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "selector": {"type": "string"}}, "required": ["url"]}}},
+    {"type": "function", "function": {"name": "browser", "description": "Control web browser", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["navigate", "click", "type", "screenshot", "scroll"]}, "url": {"type": "string"}, "selector": {"type": "string"}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "message", "description": "Send messages to channels", "parameters": {"type": "object", "properties": {"channel": {"type": "string"}, "text": {"type": "string"}, "action": {"type": "string", "enum": ["send", "reply", "react"]}}, "required": ["channel", "text"]}}},
+    {"type": "function", "function": {"name": "cron", "description": "Manage cron jobs", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["create", "list", "delete"]}, "schedule": {"type": "string"}, "systemEvent": {"type": "string"}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "memory_search", "description": "Search memory files", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "memory_get", "description": "Get memory file lines", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "lines": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "session_status", "description": "Show status card", "parameters": {"type": "object", "properties": {"model": {"type": "string"}}, "required": []}}},
+    {"type": "function", "function": {"name": "sessions_spawn", "description": "Spawn sub-agent", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "model": {"type": "string"}, "runtime": {"type": "string", "enum": ["subagent", "acp"]}}, "required": ["prompt"]}}},
+]
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw system prompt (~7,900 tokens measured)
+# Realistic approximation of the 31,475-char system prompt from OpenClaw
+# 2026.3.13 with 12 skills, 18 tools, and workspace file injections.
+# ---------------------------------------------------------------------------
+
+def build_openclaw_system_prompt(tokenizer, target_tokens=7900):
+    """Build a system prompt of exactly target_tokens.
+
+    Uses the real OpenClaw structure (instructions, skills XML, workspace
+    files) padded to match the measured 31,475-char / ~7,900-token prompt.
+    """
+    header = (
+        "You are a personal assistant running inside OpenClaw.\n\n"
+        "## Tooling\nTool availability (filtered by policy):\n"
+        "- read, write, edit, apply_patch, grep, find, ls, exec, process\n"
+        "- web_search, web_fetch, browser, message, cron\n"
+        "- memory_search, memory_get, session_status, sessions_spawn\n\n"
+        "## Safety\nPrioritize safety and human oversight.\n\n"
+        "## Skills\n<available_skills>\n"
+        "  <skill><name>todo</name><description>Task management</description>"
+        "<location>~/.openclaw/workspace/skills/todo/SKILL.md</location></skill>\n"
+        "  <skill><name>github</name><description>GitHub integration</description>"
+        "<location>~/.openclaw/workspace/skills/github/SKILL.md</location></skill>\n"
+        "  <skill><name>coding-agent</name><description>Spawn coding sub-agent</description>"
+        "<location>~/.openclaw/workspace/skills/coding-agent/SKILL.md</location></skill>\n"
+        "</available_skills>\n\n"
+        "## Workspace Files\n"
+    )
+    header_tokens = count_tokens(header, tokenizer)
+    remaining = target_tokens - header_tokens
+    if remaining > 0:
+        padding = generate_text(remaining, tokenizer, seed=8888)
+        return header + padding
+    return header
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw profile: 17-call chain across 8 user turns
+# ---------------------------------------------------------------------------
+
+# Each entry: (label, prefix_tokens, new_tokens, output_tokens)
+# prefix_tokens: tokens from prior context (KV-cached)
+# new_tokens:    tokens added this call (tool result or user message)
+# output_tokens: num_predict cap for this call
+#
+# Derived from 112 interactive turns across 64 real OpenClaw sessions.
+# Tool result sizes match measured P50/P90 from 384 real tool results.
+# Turn mix: 32% chat, 29% exec, 17% code_edit, 10% web, 8% file_read.
+
+OPENCLAW_PROFILE = [
+    # Turn 1: Chat Q&A (1 call)
+    ("T1 chat: respond",           0, 0,    2000),
+
+    # Turn 2: Run a command (2 calls)
+    ("T2 exec: call tool",         0, 50,   1500),   # user msg
+    ("T2 exec: respond",           0, 125,  2000),   # +125t exec result
+
+    # Turn 3: Web search (3 calls)
+    ("T3 web: search",             0, 50,   1500),   # user msg
+    ("T3 web: search again",       0, 550,  1500),   # +550t search results
+    ("T3 web: summarize",          0, 550,  2000),   # +550t more results
+
+    # Turn 4: Read a file (2 calls)
+    ("T4 read: call tool",         0, 50,   1500),   # user msg
+    ("T4 read: analyze",           0, 600,  2000),   # +600t file content
+
+    # Turn 5: Follow-up chat (1 call)
+    ("T5 chat: respond",           0, 50,   2000),   # user msg
+
+    # Turn 6: Exec + check (2 calls)
+    ("T6 exec: call tool",         0, 50,   1500),   # user msg
+    ("T6 exec: respond",           0, 150,  2000),   # +150t exec output
+
+    # Turn 7: Edit a file — heavy turn (4 calls)
+    ("T7 edit: read first",        0, 50,   1500),   # user msg
+    ("T7 edit: edit file",         0, 600,  2000),   # +600t file content
+    ("T7 edit: run verify",        0, 25,   1500),   # +25t edit confirm
+    ("T7 edit: respond",           0, 200,  2000),   # +200t test output
+
+    # Turn 8: Web search + summarize (2 calls)
+    ("T8 web: search",             0, 50,   1500),   # user msg
+    ("T8 web: summarize",          0, 950,  2000),   # +950t search results
+]
+
+
+# Legacy profile (backward compatible)
+LEGACY_TURNS = "0,16384,128|16384,128,128|16384,4096,512"
+
+
+# ---------------------------------------------------------------------------
 # Backend: Ollama (native API — supports num_predict for output control)
 # ---------------------------------------------------------------------------
 
-def send_ollama(url, model, text, max_tokens):
-    payload = json.dumps({
+def send_ollama(url, model, messages, max_tokens, tools=None):
+    payload = {
         "model": model,
-        "messages": [{"role": "user", "content": text}],
+        "messages": messages,
         "stream": True,
         "options": {"num_predict": max_tokens, "temperature": 0.0},
-    }).encode()
+    }
+    if tools:
+        payload["tools"] = tools
+
+    data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        f"{url}/api/chat", data=payload,
+        f"{url}/api/chat", data=data,
         headers={"Content-Type": "application/json"})
 
     t_start = time.perf_counter()
@@ -143,7 +264,7 @@ def send_ollama(url, model, text, max_tokens):
 def warmup_ollama(url, model):
     """Send small request to load model, then flush KV for clean cold start."""
     print("  [warmup] Loading model...")
-    send_ollama(url, model, "hi", 1)
+    send_ollama(url, model, [{"role": "user", "content": "hi"}], 1)
     print("  [warmup] Flushing KV cache...")
     import subprocess
     for ollama_bin in ["/usr/local/bin/ollama", "ollama"]:
@@ -154,7 +275,7 @@ def warmup_ollama(url, model):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
     time.sleep(2)
-    send_ollama(url, model, "hi", 1)
+    send_ollama(url, model, [{"role": "user", "content": "hi"}], 1)
     print("  [warmup] Ready.\n")
 
 
@@ -162,16 +283,20 @@ def warmup_ollama(url, model):
 # Backend: OpenAI-compatible (vLLM, TensorRT-LLM, llama.cpp-server)
 # ---------------------------------------------------------------------------
 
-def send_openai(url, model, text, max_tokens):
-    payload = json.dumps({
+def send_openai(url, model, messages, max_tokens, tools=None):
+    payload = {
         "model": model,
-        "messages": [{"role": "user", "content": text}],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": True,
-    }).encode()
+    }
+    if tools:
+        payload["tools"] = tools
+
+    data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        f"{url}/v1/chat/completions", data=payload,
+        f"{url}/v1/chat/completions", data=data,
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'dummy')}",
@@ -218,7 +343,6 @@ def send_openai(url, model, text, max_tokens):
                     pass
 
     t_end = time.perf_counter()
-    # Store usage_tokens in server_stats for the measure function
     server_stats = {}
     if usage_tokens is not None:
         server_stats["usage_completion_tokens"] = usage_tokens
@@ -228,7 +352,7 @@ def send_openai(url, model, text, max_tokens):
 def warmup_openai(url, model):
     """Send small request to warm up CUDA graphs / memory allocations."""
     print("  [warmup] Sending small request...")
-    send_openai(url, model, "hi", 1)
+    send_openai(url, model, [{"role": "user", "content": "hi"}], 1)
     print("  [warmup] Ready.\n")
 
 
@@ -251,15 +375,11 @@ DEFAULT_URLS = {
 }
 
 
-def measure(label, url, model, text, max_tokens, send_fn, tokenizer,
-            prefill_tokens=None):
-    """Run one request and return metrics.
-
-    prefill_tokens: number of tokens actually being prefilled (excluding cached prefix).
-                    If None, assumes all input tokens are prefilled (cold turn).
-    """
+def measure_call(label, url, model, messages, max_tokens, send_fn, tokenizer,
+                 tools=None):
+    """Run one inference call and return metrics."""
     t_start, t_first, t_end, generated_text, server = send_fn(
-        url, model, text, max_tokens)
+        url, model, messages, max_tokens, tools=tools)
 
     ttft_client = (t_first - t_start) * 1000 if t_first else 0
     decode_client = (t_end - t_first) * 1000 if t_first else 0
@@ -282,24 +402,19 @@ def measure(label, url, model, text, max_tokens, send_fn, tokenizer,
     # Decode throughput: output tokens / decode wall time
     decode_tps = tokens / (decode_client / 1000) if decode_client > 0 else 0
 
-    # Prefill throughput: only count tokens actually prefilled (not cached)
-    input_tokens = count_tokens(text, tokenizer)
-    if prefill_tokens is None:
-        prefill_tokens = input_tokens  # cold turn: everything is prefilled
-    prefill_tps = prefill_tokens / (ttft_client / 1000) if ttft_client > 0 else 0
+    # Input tokens from server (actual ISL including tool schemas)
+    server_isl = server.get("prompt_eval_count", 0)
 
-    # Warn if output is significantly shorter than requested
-    if tokens > 0 and tokens < max_tokens * 0.5:
-        print(f"  WARNING: requested {max_tokens} tokens, got {tokens} "
-              f"(model hit EOS early)")
+    # Prefill throughput
+    prefill_ms = server.get("prompt_eval_ms", 0)
+    prefill_tps = server_isl / (prefill_ms / 1000) if prefill_ms > 0 else 0
 
     return {
         "label": label,
         "ttft_client_ms": round(ttft_client, 1),
         "decode_client_ms": round(decode_client, 1),
         "total_client_ms": round(total_client, 1),
-        "input_tokens": input_tokens,
-        "prefill_tokens": prefill_tokens,
+        "server_isl": server_isl,
         "output_tokens": tokens,
         "output_tokens_requested": max_tokens,
         "token_source": token_source,
@@ -309,107 +424,137 @@ def measure(label, url, model, text, max_tokens, send_fn, tokenizer,
     }
 
 
-def print_result(r):
-    """Print a single measurement result."""
-    prefill_label = (f"{r['prefill_tokens']} prefilled"
-                     if r['prefill_tokens'] < r['input_tokens']
-                     else f"{r['input_tokens']} input tokens")
-    print(f"  Client TTFT:    {r['ttft_client_ms']:>8.0f}ms  "
-          f"({prefill_label}, {r['prefill_tps']:.0f} prefill tok/s)")
+def print_call_result(r):
+    """Print a single call result."""
+    print(f"  Client TTFT:    {r['ttft_client_ms']:>8.0f}ms")
     print(f"  Client Decode:  {r['decode_client_ms']:>8.0f}ms  "
-          f"({r['output_tokens']} output tokens [{r['token_source']}], "
-          f"{r['decode_tps']:.1f} decode tok/s)")
+          f"({r['output_tokens']} tokens [{r['token_source']}], "
+          f"{r['decode_tps']:.1f} tok/s)")
     print(f"  Client E2E:     {r['total_client_ms']:>8.0f}ms")
+    if r.get("server_isl"):
+        print(f"  Server ISL:     {r['server_isl']:>8d} tokens")
     if r.get("server_prompt_eval_ms"):
         pe = r["server_prompt_eval_ms"]
-        pc = r["server_prompt_eval_count"]
-        ev = r["server_eval_ms"]
-        ec = r["server_eval_count"]
-        pe_tps = pc / (pe / 1000) if pe > 0 else 0
+        ev = r.get("server_eval_ms", 0)
+        ec = r.get("server_eval_count", 0)
         ev_tps = ec / (ev / 1000) if ev > 0 else 0
-        print(f"  Server Prefill: {pe:>6.0f}ms  ({pc} tokens, {pe_tps:.0f} tok/s)")
-        print(f"  Server Decode:  {ev:>6.0f}ms  ({ec} tokens, {ev_tps:.1f} tok/s)")
-    if r["output_tokens"] < r["output_tokens_requested"] * 0.5 and r["output_tokens"] > 0:
-        print(f"  WARNING: Output shorter than requested "
-              f"({r['output_tokens']}/{r['output_tokens_requested']})")
+        print(f"  Server Prefill: {pe:>6.0f}ms  "
+              f"(ISL={r['server_isl']}, {r['prefill_tps']:.0f} tok/s)")
+        print(f"  Server Decode:  {ev:>6.0f}ms  "
+              f"({ec} tokens, {ev_tps:.1f} tok/s)")
     print()
 
 
-def run_turn(label, url, model, text, out_len, send_fn, tokenizer, repeats,
-             prefill_tokens=None):
-    """Run a turn N times and return all results."""
-    results = []
-    for run in range(repeats):
+def run_openclaw_profile(url, model, send_fn, tokenizer, repeats, tools,
+                         output_file):
+    """Run the OpenClaw 17-call profile."""
+    sys_prompt = build_openclaw_system_prompt(tokenizer)
+    sys_prompt_tokens = count_tokens(sys_prompt, tokenizer)
+    print(f"  System prompt: {sys_prompt_tokens} tokens (client-side)")
+    print(f"  Tool schemas: {len(tools)} tools (adds ~1,485 tokens server-side)")
+    print(f"  Profile: openclaw (8 turns, 17 inference calls)")
+
+    all_results = []
+    all_summaries = []
+
+    for rep in range(repeats):
         if repeats > 1:
-            print(f"{label} [run {run+1}/{repeats}]:")
-        else:
-            print(f"{label}:")
-        r = measure(label, url, model, text, out_len, send_fn, tokenizer,
-                    prefill_tokens=prefill_tokens)
-        print_result(r)
-        results.append(r)
-    return results
+            print(f"\n{'='*60}")
+            print(f"  Run {rep+1}/{repeats}")
+            print(f"{'='*60}")
+
+        # Build conversation: start with system prompt
+        messages = [{"role": "system", "content": sys_prompt}]
+        cumulative_new = 0
+
+        run_results = []
+        for i, (label, _prefix, new_tokens, out_tokens) in enumerate(OPENCLAW_PROFILE):
+            # Add new tokens (user message or tool result) to conversation
+            if new_tokens > 0:
+                new_text = generate_text(new_tokens, tokenizer, seed=5000 + i)
+                # Alternate between user and tool-result-like messages
+                if "respond" in label or "summarize" in label or "analyze" in label:
+                    messages.append({"role": "user", "content": new_text})
+                else:
+                    # Simulate tool result appended as assistant context
+                    messages.append({"role": "user",
+                                     "content": f"[Tool Result]\n{new_text}"})
+                cumulative_new += new_tokens
+
+            if repeats > 1:
+                print(f"{label} [run {rep+1}]:")
+            else:
+                print(f"{label}:")
+
+            r = measure_call(label, url, model, messages, out_tokens, send_fn,
+                             tokenizer, tools=tools)
+            print_call_result(r)
+            run_results.append(r)
+
+            # Append a short assistant response to conversation
+            # (simulates visible output that stays in context)
+            visible_response = generate_text(50, tokenizer, seed=6000 + i)
+            messages.append({"role": "assistant", "content": visible_response})
+
+        all_results.append(run_results)
+
+    # Summary
+    print(f"{'='*60}")
+    print(f"  SUMMARY — {platform.node()} — {model}")
+    print(f"{'='*60}")
+
+    # Aggregate across calls and runs
+    for i, (label, _, _, _) in enumerate(OPENCLAW_PROFILE):
+        call_results = [run[i] for run in all_results]
+        ttfts = [r["ttft_client_ms"] for r in call_results]
+        e2es = [r["total_client_ms"] for r in call_results]
+        decode_list = [r["decode_tps"] for r in call_results if r["decode_tps"] > 0]
+        isls = [r["server_isl"] for r in call_results if r["server_isl"] > 0]
+
+        ttft = statistics.median(ttfts) if ttfts else 0
+        e2e = statistics.median(e2es) if e2es else 0
+        dec = statistics.median(decode_list) if decode_list else 0
+        isl = statistics.median(isls) if isls else 0
+
+        all_summaries.append({
+            "label": label, "ttft_ms": round(ttft),
+            "e2e_ms": round(e2e), "decode_tps": round(dec, 1),
+            "server_isl": round(isl),
+        })
+
+    print(f"\n  {'Call':<30s} {'ISL':>7s} {'TTFT':>8s} {'E2E':>8s} {'Decode':>8s}")
+    print(f"  {'-'*65}")
+    for s in all_summaries:
+        print(f"  {s['label']:<30s} {s['server_isl']:>6.0f}t "
+              f"{s['ttft_ms']:>7.0f}ms {s['e2e_ms']:>7.0f}ms "
+              f"{s['decode_tps']:>7.1f}t/s")
+
+    if output_file:
+        out = {
+            "host": platform.node(),
+            "model": model,
+            "tokenizer": args.tokenizer,
+            "backend": args.backend,
+            "url": url,
+            "profile": "openclaw",
+            "repeats": repeats,
+            "system_prompt_tokens": sys_prompt_tokens,
+            "tool_count": len(tools),
+            "summaries": all_summaries,
+            "results": [[{k: v for k, v in r.items()} for r in run]
+                        for run in all_results],
+        }
+        with open(output_file, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\n  Saved: {output_file}")
 
 
-def summarize(turn_results):
-    """Compute median/stddev across repeated runs for a single turn."""
-    ttfts = [r["ttft_client_ms"] for r in turn_results]
-    e2els = [r["total_client_ms"] for r in turn_results]
-    decode_tps_list = [r["decode_tps"] for r in turn_results if r["decode_tps"] > 0]
-    prefill_tps_list = [r["prefill_tps"] for r in turn_results if r["prefill_tps"] > 0]
-
-    def med(lst): return round(statistics.median(lst), 1) if lst else 0
-    def std(lst): return round(statistics.stdev(lst), 1) if len(lst) > 1 else 0
-
-    summary = {
-        "label": turn_results[0]["label"],
-        "ttft_median_ms": med(ttfts),
-        "ttft_stddev_ms": std(ttfts),
-        "e2e_median_ms": med(e2els),
-        "e2e_stddev_ms": std(e2els),
-        "decode_tps_median": med(decode_tps_list),
-        "decode_tps_stddev": std(decode_tps_list),
-        "prefill_tps_median": med(prefill_tps_list),
-        "prefill_tps_stddev": std(prefill_tps_list),
-        "runs": len(turn_results),
-        "all_ttfts": ttfts,
-        "all_e2els": e2els,
-    }
-    return summary
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Measure TTFT and tok/s for local inference servers",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__)
-    parser.add_argument("--url", default=None,
-                        help="Server URL (default: per-backend)")
-    parser.add_argument("--model", required=True,
-                        help="Model name for API requests")
-    parser.add_argument("--tokenizer", required=True,
-                        help="HuggingFace tokenizer name")
-    parser.add_argument("--backend", required=True,
-                        choices=["ollama", "vllm", "trtllm", "llamacpp"],
-                        help="Inference backend")
-    parser.add_argument("--repeats", type=int, default=1,
-                        help="Runs per turn for median/stddev (default: 1)")
-    parser.add_argument("--turns",
-                        default="0,16384,128|16384,128,128|16384,4096,512",
-                        help="Turn configs: prefix,new_tokens,output_tokens "
-                             "(pipe-separated)")
-    parser.add_argument("--output", default=None,
-                        help="Save results to JSON file")
-    args = parser.parse_args()
-
-    url = args.url or DEFAULT_URLS[args.backend]
-    send_fn = BACKENDS[args.backend]["send"]
-    warmup_fn = BACKENDS[args.backend]["warmup"]
-    tokenizer = get_tokenizer(args.tokenizer)
-
+def run_legacy_profile(url, model, send_fn, tokenizer, repeats, turns_str,
+                       output_file):
+    """Run the legacy turn-based profile (backward compatible)."""
     # Parse turn configs
     turns = []
-    for spec in args.turns.split("|"):
+    for spec in turns_str.split("|"):
         parts = spec.strip().split(",")
         if len(parts) != 3:
             print(f"Invalid turn config: {spec}")
@@ -430,12 +575,117 @@ def main():
         if prefix_len > 0:
             suffix_texts[i] = generate_text(new_len, tokenizer, seed=100 + i)
 
+    all_summaries = []
+    all_results = []
+
+    for i, (prefix_len, new_len, out_len) in enumerate(turns):
+        if prefix_len == 0:
+            text = generate_text(new_len, tokenizer, seed=42)
+            label = f"Turn {i+1}: {new_len//1024}K cold"
+        else:
+            text = prefix_text + " " + suffix_texts[i]
+            label = f"Turn {i+1}: {prefix_len//1024}K cached + {new_len} new"
+
+        messages = [{"role": "user", "content": text}]
+        turn_results = []
+        for run in range(repeats):
+            if repeats > 1:
+                print(f"{label} [run {run+1}/{repeats}]:")
+            else:
+                print(f"{label}:")
+            r = measure_call(label, url, model, messages, out_len, send_fn,
+                             tokenizer)
+            print_call_result(r)
+            turn_results.append(r)
+
+        all_results.extend(turn_results)
+
+        # Summarize
+        ttfts = [r["ttft_client_ms"] for r in turn_results]
+        e2es = [r["total_client_ms"] for r in turn_results]
+        decode_list = [r["decode_tps"] for r in turn_results if r["decode_tps"] > 0]
+
+        def med(lst): return round(statistics.median(lst), 1) if lst else 0
+        def std(lst): return round(statistics.stdev(lst), 1) if len(lst) > 1 else 0
+
+        all_summaries.append({
+            "label": label,
+            "ttft_median_ms": med(ttfts), "ttft_stddev_ms": std(ttfts),
+            "e2e_median_ms": med(e2es), "e2e_stddev_ms": std(e2es),
+            "decode_tps_median": med(decode_list),
+            "decode_tps_stddev": std(decode_list),
+            "runs": len(turn_results),
+        })
+
+    # Summary table
+    print(f"{'='*60}")
+    print(f"  SUMMARY — {platform.node()} — {model}")
+    print(f"{'='*60}")
+    print(f"  {'Turn':<30s} {'TTFT':>9s} {'E2E':>9s} {'decode':>9s}")
+    print(f"  {'-'*60}")
+    for s in all_summaries:
+        print(f"  {s['label']:<30s} {s['ttft_median_ms']:>8.0f}ms "
+              f"{s['e2e_median_ms']:>8.0f}ms "
+              f"{s['decode_tps_median']:>7.1f}t/s")
+
+    if output_file:
+        out = {
+            "host": platform.node(),
+            "model": model,
+            "tokenizer": args.tokenizer,
+            "backend": args.backend,
+            "url": url,
+            "profile": "legacy",
+            "turns": turns_str,
+            "repeats": repeats,
+            "summaries": all_summaries,
+            "results": all_results,
+        }
+        with open(output_file, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\n  Saved: {output_file}")
+
+
+def main():
+    global args
+    parser = argparse.ArgumentParser(
+        description="Measure TTFT and tok/s for local inference servers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    parser.add_argument("--url", default=None,
+                        help="Server URL (default: per-backend)")
+    parser.add_argument("--model", required=True,
+                        help="Model name for API requests")
+    parser.add_argument("--tokenizer", required=True,
+                        help="HuggingFace tokenizer name")
+    parser.add_argument("--backend", required=True,
+                        choices=["ollama", "vllm", "trtllm", "llamacpp"],
+                        help="Inference backend")
+    parser.add_argument("--repeats", type=int, default=1,
+                        help="Runs per turn for median/stddev (default: 1)")
+    parser.add_argument("--profile", default="openclaw",
+                        choices=["openclaw", "legacy"],
+                        help="Workload profile (default: openclaw)")
+    parser.add_argument("--turns", default=None,
+                        help="Custom turn configs (overrides --profile): "
+                             "prefix,new_tokens,output_tokens (pipe-separated)")
+    parser.add_argument("--no-tools", action="store_true",
+                        help="Disable tool schemas in requests")
+    parser.add_argument("--no-system-prompt", action="store_true",
+                        help="Disable system prompt (legacy behavior)")
+    parser.add_argument("--output", default=None,
+                        help="Save results to JSON file")
+    args = parser.parse_args()
+
+    url = args.url or DEFAULT_URLS[args.backend]
+    send_fn = BACKENDS[args.backend]["send"]
+    warmup_fn = BACKENDS[args.backend]["warmup"]
+    tokenizer = get_tokenizer(args.tokenizer)
+    tools = None if args.no_tools else OPENCLAW_TOOLS
+
     print(f"\n{'='*60}")
     print(f"  {platform.node()} — {args.model} via {args.backend}")
     print(f"  URL: {url}")
-    print(f"  Turns: {args.turns}")
-    if args.repeats > 1:
-        print(f"  Repeats: {args.repeats} per turn")
     print(f"{'='*60}\n")
 
     warmup_fn(url, args.model)
@@ -444,69 +694,16 @@ def main():
     print(f"  RESULTS")
     print(f"{'='*60}\n")
 
-    all_summaries = []
-    all_results = []
-
-    for i, (prefix_len, new_len, out_len) in enumerate(turns):
-        if prefix_len == 0:
-            # Cold turn: all tokens are prefilled
-            text = generate_text(new_len, tokenizer, seed=42)
-            label = f"Turn {i+1}: {new_len//1024}K cold"
-            prefill_tokens = None  # measure() will count all input tokens
-        else:
-            # Warm turn: only new_len tokens are prefilled, prefix is cached
-            text = prefix_text + " " + suffix_texts[i]
-            label = f"Turn {i+1}: {prefix_len//1024}K cached + {new_len} new"
-            prefill_tokens = new_len
-
-        turn_results = run_turn(
-            label, url, args.model, text, out_len, send_fn, tokenizer,
-            args.repeats, prefill_tokens=prefill_tokens)
-        all_results.extend(turn_results)
-        all_summaries.append(summarize(turn_results))
-
-    # Summary table
-    print(f"{'='*60}")
-    print(f"  SUMMARY — {platform.node()} — {args.model} ({args.backend})")
-    print(f"{'='*60}")
-
-    if args.repeats > 1:
-        print(f"  {'Turn':<30s} {'TTFT med':>9s} {'±':>5s} "
-              f"{'E2E med':>9s} {'±':>5s} "
-              f"{'prefill':>9s} {'decode':>9s}")
-        print(f"  {'-'*80}")
-        for s in all_summaries:
-            print(f"  {s['label']:<30s} {s['ttft_median_ms']:>8.0f}ms "
-                  f"{s['ttft_stddev_ms']:>4.0f} "
-                  f"{s['e2e_median_ms']:>8.0f}ms "
-                  f"{s['e2e_stddev_ms']:>4.0f} "
-                  f"{s['prefill_tps_median']:>7.0f}t/s "
-                  f"{s['decode_tps_median']:>7.1f}t/s")
+    if args.turns:
+        # Custom turns override — use legacy runner
+        run_legacy_profile(url, args.model, send_fn, tokenizer, args.repeats,
+                          args.turns, args.output)
+    elif args.profile == "openclaw":
+        run_openclaw_profile(url, args.model, send_fn, tokenizer, args.repeats,
+                            tools, args.output)
     else:
-        print(f"  {'Turn':<30s} {'TTFT':>9s} {'E2E':>9s} "
-              f"{'prefill':>9s} {'decode':>9s}")
-        print(f"  {'-'*70}")
-        for s in all_summaries:
-            print(f"  {s['label']:<30s} {s['ttft_median_ms']:>8.0f}ms "
-                  f"{s['e2e_median_ms']:>8.0f}ms "
-                  f"{s['prefill_tps_median']:>7.0f}t/s "
-                  f"{s['decode_tps_median']:>7.1f}t/s")
-
-    if args.output:
-        out = {
-            "host": platform.node(),
-            "model": args.model,
-            "tokenizer": args.tokenizer,
-            "backend": args.backend,
-            "url": url,
-            "turns": args.turns,
-            "repeats": args.repeats,
-            "summaries": all_summaries,
-            "results": all_results,
-        }
-        with open(args.output, "w") as f:
-            json.dump(out, f, indent=2)
-        print(f"\n  Saved: {args.output}")
+        run_legacy_profile(url, args.model, send_fn, tokenizer, args.repeats,
+                          LEGACY_TURNS, args.output)
 
 
 if __name__ == "__main__":
