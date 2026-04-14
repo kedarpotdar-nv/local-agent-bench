@@ -306,6 +306,7 @@ def send_openai(url, model, messages, max_tokens, tools=None):
     t_first = None
     generated_text = ""
     usage_tokens = None
+    usage_prompt_tokens = None
 
     with urllib.request.urlopen(req, timeout=600) as resp:
         buf = b""
@@ -339,6 +340,8 @@ def send_openai(url, model, messages, max_tokens, tools=None):
                     usage = obj.get("usage")
                     if usage and usage.get("completion_tokens"):
                         usage_tokens = usage["completion_tokens"]
+                    if usage and usage.get("prompt_tokens"):
+                        usage_prompt_tokens = usage["prompt_tokens"]
                 except json.JSONDecodeError:
                     pass
 
@@ -346,6 +349,8 @@ def send_openai(url, model, messages, max_tokens, tools=None):
     server_stats = {}
     if usage_tokens is not None:
         server_stats["usage_completion_tokens"] = usage_tokens
+    if usage_prompt_tokens is not None:
+        server_stats["prompt_eval_count"] = usage_prompt_tokens
     return t_start, t_first, t_end, generated_text, server_stats
 
 
@@ -454,13 +459,28 @@ def print_call_result(r):
     print()
 
 
+TOOL_ISL_OVERHEAD = 1485  # measured tokens added by 18 tool schemas on Ollama
+
+
 def run_openclaw_profile(url, model, send_fn, tokenizer, repeats, tools,
                          output_file):
     """Run the OpenClaw 17-call profile."""
     sys_prompt = build_openclaw_system_prompt(tokenizer)
+
+    if not tools:
+        # Option C: pad system prompt to compensate for missing tool ISL
+        # so ISL is consistent across backends that don't support tools
+        print(f"  No tools — padding system prompt with ~{TOOL_ISL_OVERHEAD} tokens "
+              f"to match tool ISL overhead")
+        padding = generate_text(TOOL_ISL_OVERHEAD, tokenizer, seed=7777)
+        sys_prompt = sys_prompt + "\n\n## Additional Context\n" + padding
+
     sys_prompt_tokens = count_tokens(sys_prompt, tokenizer)
     print(f"  System prompt: {sys_prompt_tokens} tokens (client-side)")
-    print(f"  Tool schemas: {len(tools)} tools (adds ~1,485 tokens server-side)")
+    if tools:
+        print(f"  Tool schemas: {len(tools)} tools (adds ~{TOOL_ISL_OVERHEAD} tokens server-side)")
+    else:
+        print(f"  Tool schemas: none (ISL padded in system prompt instead)")
     print(f"  Profile: openclaw (8 turns, 17 inference calls)")
 
     all_results = []
@@ -558,7 +578,7 @@ def run_openclaw_profile(url, model, send_fn, tokenizer, repeats, tools,
             "profile": "openclaw",
             "repeats": repeats,
             "system_prompt_tokens": sys_prompt_tokens,
-            "tool_count": len(tools),
+            "tool_count": len(tools) if tools else 0,
             "summaries": all_summaries,
             "results": [[{k: v for k, v in r.items()} for r in run]
                         for run in all_results],
