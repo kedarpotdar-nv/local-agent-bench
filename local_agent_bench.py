@@ -162,14 +162,18 @@ def warmup_ollama(url, model):
 # Backend: OpenAI-compatible (vLLM, TensorRT-LLM, llama.cpp-server)
 # ---------------------------------------------------------------------------
 
-def send_openai(url, model, text, max_tokens):
-    payload = json.dumps({
+def send_openai(url, model, text, max_tokens, ignore_eos=False):
+    body = {
         "model": model,
         "messages": [{"role": "user", "content": text}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": True,
-    }).encode()
+        "stream_options": {"include_usage": True},
+    }
+    if ignore_eos:
+        body["ignore_eos"] = True
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{url}/v1/chat/completions", data=payload,
         headers={
@@ -225,10 +229,17 @@ def send_openai(url, model, text, max_tokens):
     return t_start, t_first, t_end, generated_text, server_stats
 
 
-def warmup_openai(url, model):
-    """Send small request to warm up CUDA graphs / memory allocations."""
-    print("  [warmup] Sending small request...")
-    send_openai(url, model, "hi", 1)
+def warmup_openai(url, model, tokenizer=None, isl=0, osl=0):
+    """Send a request matching the benchmark ISL/OSL to warm up CUDA graphs."""
+    print("  [warmup] Sending warm-up request (ISL shape)...")
+    if tokenizer and isl > 0:
+        text = generate_text(isl, tokenizer, seed=0)
+        max_tok = max(osl, 8)
+    else:
+        text = "warmup"
+        max_tok = 8
+    send_openai(url, model, text, max_tok,
+                ignore_eos=(tokenizer is not None and osl > 0))
     print("  [warmup] Ready.\n")
 
 
@@ -252,20 +263,31 @@ DEFAULT_URLS = {
 
 
 def measure(label, url, model, text, max_tokens, send_fn, tokenizer,
-            prefill_tokens=None):
+            prefill_tokens=None, ignore_eos=False):
     """Run one request and return metrics.
 
     prefill_tokens: number of tokens actually being prefilled (excluding cached prefix).
                     If None, assumes all input tokens are prefilled (cold turn).
     """
-    t_start, t_first, t_end, generated_text, server = send_fn(
-        url, model, text, max_tokens)
+    if ignore_eos and send_fn == send_openai:
+        t_start, t_first, t_end, generated_text, server = send_fn(
+            url, model, text, max_tokens, ignore_eos=True)
+    else:
+        t_start, t_first, t_end, generated_text, server = send_fn(
+            url, model, text, max_tokens)
 
     ttft_client = (t_first - t_start) * 1000 if t_first else 0
     decode_client = (t_end - t_first) * 1000 if t_first else 0
     total_client = (t_end - t_start) * 1000
 
-    # Token count priority: server eval_count > server usage > tokenizer count
+    # Token count priority:
+    #   1. server eval_count (Ollama): counts all tokens natively
+    #   2. server usage_completion_tokens (vLLM without --reasoning-parser):
+    #      counts ALL tokens including thinking; only undercounts if
+    #      --reasoning-parser is active (which routes thinking to reasoning_content
+    #      and excludes it from usage). Don't use --reasoning-parser.
+    #   3. tokenizer on generated_text: fallback; re-encodes decoded text which
+    #      can miscount for degenerate outputs (e.g. repeated newlines → fewer BPE tokens)
     if server.get("eval_count"):
         tokens = server["eval_count"]
         token_source = "server eval_count"
@@ -336,7 +358,7 @@ def print_result(r):
 
 
 def run_turn(label, url, model, text, out_len, send_fn, tokenizer, repeats,
-             prefill_tokens=None):
+             prefill_tokens=None, ignore_eos=False):
     """Run a turn N times and return all results."""
     results = []
     for run in range(repeats):
@@ -345,7 +367,7 @@ def run_turn(label, url, model, text, out_len, send_fn, tokenizer, repeats,
         else:
             print(f"{label}:")
         r = measure(label, url, model, text, out_len, send_fn, tokenizer,
-                    prefill_tokens=prefill_tokens)
+                    prefill_tokens=prefill_tokens, ignore_eos=ignore_eos)
         print_result(r)
         results.append(r)
     return results
@@ -400,6 +422,8 @@ def main():
                              "(pipe-separated)")
     parser.add_argument("--output", default=None,
                         help="Save results to JSON file")
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="Force generation to exactly output_tokens (vLLM/llamacpp only)")
     args = parser.parse_args()
 
     url = args.url or DEFAULT_URLS[args.backend]
@@ -430,15 +454,26 @@ def main():
         if prefix_len > 0:
             suffix_texts[i] = generate_text(new_len, tokenizer, seed=100 + i)
 
+    if args.ignore_eos and args.backend == "ollama":
+        print("  WARNING: --ignore-eos has no effect on ollama (use num_predict only)")
+
     print(f"\n{'='*60}")
     print(f"  {platform.node()} — {args.model} via {args.backend}")
     print(f"  URL: {url}")
     print(f"  Turns: {args.turns}")
+    if args.ignore_eos:
+        print(f"  ignore_eos: true (output forced to exact token count)")
     if args.repeats > 1:
         print(f"  Repeats: {args.repeats} per turn")
     print(f"{'='*60}\n")
 
-    warmup_fn(url, args.model)
+    # Warmup with the first cold turn's ISL/OSL so the GPU is shaped correctly
+    first_cold = next(((nl, ol) for (pl, nl, ol) in turns if pl == 0), (0, 0))
+    if args.backend in ("vllm", "trtllm", "llamacpp"):
+        warmup_fn(url, args.model, tokenizer=tokenizer,
+                  isl=first_cold[0], osl=first_cold[1])
+    else:
+        warmup_fn(url, args.model)
 
     print(f"{'='*60}")
     print(f"  RESULTS")
@@ -461,7 +496,8 @@ def main():
 
         turn_results = run_turn(
             label, url, args.model, text, out_len, send_fn, tokenizer,
-            args.repeats, prefill_tokens=prefill_tokens)
+            args.repeats, prefill_tokens=prefill_tokens,
+            ignore_eos=args.ignore_eos)
         all_results.extend(turn_results)
         all_summaries.append(summarize(turn_results))
 
